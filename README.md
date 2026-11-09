@@ -430,6 +430,10 @@ python -m scripts.texture_i2tex \
 
 It will save the textured model into `<save_dir>/<save_name>_shaded.glb`.
 
+### Low-memory Windows experiment (this fork)
+
+An isolated SD2.1 image-and-geometry path for a separate Windows environment is documented in [docs/LOWMEM_IG2MV_WINDOWS.md](docs/LOWMEM_IG2MV_WINDOWS.md). It does not change the TripoSG or ComfyUI installs. It has not been measured on an 8 GB GPU in the authoring environment. The SDXL ig2mv path is unchanged and is still the upstream >16 GB setting.
+
 ## 📊 Dataset
 
 Our training dataset, rendered from [Objaverse](https://huggingface.co/datasets/allenai/objaverse), can be downloaded from [Objaverse-Ortho10View](https://huggingface.co/datasets/huanngzh/Objaverse-Ortho10View) and [Objaverse-Rand6View](https://huggingface.co/datasets/huanngzh/Objaverse-Rand6View). Our render code can be found at [bpyrenderer](https://github.com/huanngzh/bpy-renderer).

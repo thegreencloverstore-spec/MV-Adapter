@@ -263,6 +263,9 @@ class MVAdapterI2MVSDPipeline(StableDiffusionPipeline, CustomAdapterMixin):
         # Optional. controlnet
         controlnet_image: Optional[PipelineImageInput] = None,
         controlnet_conditioning_scale: Optional[float] = 1.0,
+        # Run the unconditional and conditional six-view batches as two forwards.
+        # The guidance formula is unchanged. Peak activation batch drops from 12 to 6.
+        split_cfg: bool = False,
         **kwargs,
     ):
         r"""
@@ -508,21 +511,45 @@ class MVAdapterI2MVSDPipeline(StableDiffusionPipeline, CustomAdapterMixin):
                 k: v.repeat_interleave(num_images_per_prompt, dim=0)
                 for k, v in ref_hidden_states.items()
             }
-        if self.do_classifier_free_guidance:
-            ref_hidden_states = {
-                k: torch.cat([torch.zeros_like(v), v], dim=0)
-                for k, v in ref_hidden_states.items()
+        # Split CFG keeps each guidance branch at num_views instead of concatenating
+        # them. Row/column attention still sees all six views inside a branch.
+        split_cfg = bool(split_cfg) and self.do_classifier_free_guidance
+        if split_cfg and (
+            controlnet_image is not None
+            or ip_adapter_image is not None
+            or ip_adapter_image_embeds is not None
+            or timestep_cond is not None
+        ):
+            raise RuntimeError(
+                "split_cfg is implemented for image-and-geometry SD conditioning only. "
+                "ControlNet, IP-Adapter, and time-conditioning embeddings are not split."
+            )
+        if split_cfg:
+            ref_uncond_states = {
+                k: torch.zeros_like(v) for k, v in ref_hidden_states.items()
             }
+            ref_cond_states = {k: v.clone() for k, v in ref_hidden_states.items()}
+            ref_for_kwargs = ref_cond_states
+        else:
+            ref_uncond_states = None
+            ref_cond_states = None
+            if self.do_classifier_free_guidance:
+                ref_hidden_states = {
+                    k: torch.cat([torch.zeros_like(v), v], dim=0)
+                    for k, v in ref_hidden_states.items()
+                }
+            ref_for_kwargs = ref_hidden_states
 
         cross_attention_kwargs = {
             "num_views": num_images_per_prompt,
             "mv_scale": mv_scale,
-            "ref_hidden_states": {k: v.clone() for k, v in ref_hidden_states.items()},
+            "ref_hidden_states": {k: v.clone() for k, v in ref_for_kwargs.items()},
             "ref_scale": reference_conditioning_scale,
             **(self.cross_attention_kwargs or {}),
         }
 
-        # Preprocess control image
+        # Preprocess control image. Both CFG halves receive the same geometry
+        # control, so the split path encodes the six views once.
         control_image_feature = self.prepare_control_image(
             image=control_image,
             width=width,
@@ -531,7 +558,8 @@ class MVAdapterI2MVSDPipeline(StableDiffusionPipeline, CustomAdapterMixin):
             num_images_per_prompt=1,  # NOTE: always 1 for control images
             device=device,
             dtype=latents.dtype,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            do_classifier_free_guidance=self.do_classifier_free_guidance
+            and not split_cfg,
         )
         control_image_feature = control_image_feature.to(
             device=device, dtype=latents.dtype
@@ -564,16 +592,6 @@ class MVAdapterI2MVSDPipeline(StableDiffusionPipeline, CustomAdapterMixin):
                 if self.interrupt:
                     continue
 
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents] * 2)
-                    if self.do_classifier_free_guidance
-                    else latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
-
                 if i < int(num_inference_steps * control_conditioning_factor):
                     down_intrablock_additional_residuals = [
                         state.clone() for state in adapter_state
@@ -581,46 +599,94 @@ class MVAdapterI2MVSDPipeline(StableDiffusionPipeline, CustomAdapterMixin):
                 else:
                     down_intrablock_additional_residuals = None
 
-                unet_add_kwargs = {}
-
-                # Do controlnet if provided
-                if do_controlnet:
-                    down_block_res_samples, mid_block_res_sample = self.controlnet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=prompt_embeds,
-                        controlnet_cond=controlnet_image,
-                        conditioning_scale=controlnet_conditioning_scale,
-                        guess_mode=False,
-                        added_cond_kwargs=added_cond_kwargs,
-                        return_dict=False,
-                    )
-                    unet_add_kwargs.update(
-                        {
-                            "down_block_additional_residuals": down_block_res_samples,
-                            "mid_block_additional_residual": mid_block_res_sample,
+                if split_cfg:
+                    half = prompt_embeds.shape[0] // 2
+                    noise_pred_uncond, noise_pred_text = None, None
+                    for part, ref_states in (
+                        (0, ref_uncond_states),
+                        (1, ref_cond_states),
+                    ):
+                        part_kwargs = dict(cross_attention_kwargs)
+                        part_kwargs["ref_hidden_states"] = {
+                            k: v for k, v in ref_states.items()
                         }
-                    )
-
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                    down_intrablock_additional_residuals=down_intrablock_additional_residuals,
-                    added_cond_kwargs=added_cond_kwargs,
-                    return_dict=False,
-                    **unet_add_kwargs,
-                )[0]
-
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        # scale_model_input can be in-place on some schedulers.
+                        part_latents = self.scheduler.scale_model_input(
+                            latents.clone(), t
+                        )
+                        noise_part = self.unet(
+                            part_latents,
+                            t,
+                            encoder_hidden_states=prompt_embeds[
+                                part * half : (part + 1) * half
+                            ],
+                            timestep_cond=None,
+                            cross_attention_kwargs=part_kwargs,
+                            down_intrablock_additional_residuals=down_intrablock_additional_residuals,
+                            added_cond_kwargs=None,
+                            return_dict=False,
+                        )[0]
+                        if part == 0:
+                            noise_pred_uncond = noise_part
+                        else:
+                            noise_pred_text = noise_part
+                        del part_latents, noise_part
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     noise_pred = noise_pred_uncond + self.guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
+                else:
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = (
+                        torch.cat([latents] * 2)
+                        if self.do_classifier_free_guidance
+                        else latents
+                    )
+                    latent_model_input = self.scheduler.scale_model_input(
+                        latent_model_input, t
+                    )
+
+                    unet_add_kwargs = {}
+
+                    # Do controlnet if provided
+                    if do_controlnet:
+                        down_block_res_samples, mid_block_res_sample = self.controlnet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=prompt_embeds,
+                            controlnet_cond=controlnet_image,
+                            conditioning_scale=controlnet_conditioning_scale,
+                            guess_mode=False,
+                            added_cond_kwargs=added_cond_kwargs,
+                            return_dict=False,
+                        )
+                        unet_add_kwargs.update(
+                            {
+                                "down_block_additional_residuals": down_block_res_samples,
+                                "mid_block_additional_residual": mid_block_res_sample,
+                            }
+                        )
+
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                        down_intrablock_additional_residuals=down_intrablock_additional_residuals,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                        **unet_add_kwargs,
+                    )[0]
+
+                    # perform guidance
+                    if self.do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (
+                            noise_pred_text - noise_pred_uncond
+                        )
 
                 if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
                     # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
