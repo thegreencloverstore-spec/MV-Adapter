@@ -3,9 +3,17 @@ from abc import ABC, abstractmethod
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 from torch.utils.cpp_extension import load_inline
+
+# Triton has no supported native Windows wheel. The default texture bake does
+# not call the Triton solver. Import it only when it is installed so geometry
+# conditioning can still be imported on Windows.
+try:
+    import triton
+    import triton.language as tl
+except Exception:
+    triton = None
+    tl = None
 
 from .utils import SINGLE_IMAGE_TYPE, image_to_tensor
 
@@ -111,41 +119,44 @@ class PBBackend(ABC):
         pass
 
 
-try:
+pb_triton_step_kernel = None
+if triton is not None:
 
-    @triton.jit
-    def pb_triton_step_kernel(
-        A_ptr,
-        X_ptr,
-        B_ptr,
-        Xbuf_ptr,
-        A_row_stride: tl.constexpr,
-        n_elements: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
-        block_start = pid * BLOCK_SIZE
-        offsets = tl.arange(0, BLOCK_SIZE) + block_start
+    try:
 
-        A_start_ptr = A_ptr + block_start * A_row_stride
-        A_ptrs = A_start_ptr + (
-            tl.arange(0, BLOCK_SIZE)[:, None] * A_row_stride
-            + tl.arange(0, A_row_stride)[None, :]
-        )
-        B_ptrs = B_ptr + offsets
-        Xbuf_ptrs = Xbuf_ptr + offsets
+        @triton.jit
+        def pb_triton_step_kernel(
+            A_ptr,
+            X_ptr,
+            B_ptr,
+            Xbuf_ptr,
+            A_row_stride: tl.constexpr,
+            n_elements: tl.constexpr,
+            BLOCK_SIZE: tl.constexpr,
+        ):
+            pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
+            block_start = pid * BLOCK_SIZE
+            offsets = tl.arange(0, BLOCK_SIZE) + block_start
 
-        mask = offsets < n_elements
+            A_start_ptr = A_ptr + block_start * A_row_stride
+            A_ptrs = A_start_ptr + (
+                tl.arange(0, BLOCK_SIZE)[:, None] * A_row_stride
+                + tl.arange(0, A_row_stride)[None, :]
+            )
+            B_ptrs = B_ptr + offsets
+            Xbuf_ptrs = Xbuf_ptr + offsets
 
-        A = tl.load(A_ptrs, mask=mask[:, None], other=0)
-        X = tl.load(X_ptr + A)
-        B = tl.load(B_ptrs, mask=mask, other=0.0)
+            mask = offsets < n_elements
 
-        Xout = (tl.sum(X, axis=1) + B) / 4
-        tl.store(Xbuf_ptrs, Xout, mask=mask)
+            A = tl.load(A_ptrs, mask=mask[:, None], other=0)
+            X = tl.load(X_ptr + A)
+            B = tl.load(B_ptrs, mask=mask, other=0.0)
 
-except:
-    pb_triton_step_kernel = None
+            Xout = (tl.sum(X, axis=1) + B) / 4
+            tl.store(Xbuf_ptrs, Xout, mask=mask)
+
+    except Exception:
+        pb_triton_step_kernel = None
 
 
 class PBTorchCUDAKernelBackend(PBBackend):

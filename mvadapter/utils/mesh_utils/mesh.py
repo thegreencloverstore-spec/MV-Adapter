@@ -1,4 +1,3 @@
-import io
 import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -426,67 +425,29 @@ def replace_mesh_texture_and_save_gltflib(
     task_id: str = "",
     **kwargs,
 ) -> None:
-    from gltflib import GLTF
-    from gltflib import Image as gltfImage
-    from gltflib import NormalTextureInfo, Texture, TextureInfo
+    from .gltf_export import embed_textures_in_glb
 
     def convert_image(tensor):
-        texture = tensor_to_image(tensor)
-        texture.format = texture_format
-        return texture
-
-    def add_texture(gltf: GLTF, image: Image.Image) -> int:
-        jpeg_buffer = io.BytesIO()
-        image.save(jpeg_buffer, format=texture_format)
-        new_texture_data = bytearray(jpeg_buffer.getvalue())
-        _, offset, bytelen = gltf._create_or_extend_glb_resource(new_texture_data)
-        bufferView = gltf._create_embedded_image_buffer_view(offset, bytelen)
-        image = gltfImage(mimeType="image/jpeg", bufferView=bufferView)
-        if gltf.model.images:
-            gltf.model.images.append(image)
-        else:
-            gltf.model.images = [image]
-        texture = Texture(source=len(gltf.model.images) - 1)
-        if gltf.model.textures:
-            gltf.model.textures.append(texture)
-        else:
-            gltf.model.textures = [texture]
-        return len(gltf.model.textures) - 1
-
-    gltf = GLTF.load(input_path)
+        image = tensor_to_image(tensor)
+        image.format = texture_format
+        return image
 
     texture = convert_image(texture)
     if metallic_roughness_texture is not None:
         metallic_roughness_texture = convert_image(metallic_roughness_texture)
-
     if normal_texture is not None:
         normal_texture = convert_image(normal_texture)
 
-    pbr_material = gltf.model.materials[0].pbrMetallicRoughness
-
-    pbr_material.baseColorTexture = TextureInfo(index=add_texture(gltf, texture))
-    pbr_material.baseColorFactor = [1, 1, 1, 1]
-
-    if metallic_roughness_texture is not None:
-        pbr_material.metallicRoughnessTexture = TextureInfo(
-            index=add_texture(gltf, metallic_roughness_texture)
-        )
-        pbr_material.metallicFactor = 1.0
-        pbr_material.roughnessFactor = 1.0
-    else:
-        pbr_material.metallicFactor = 0.0
-        pbr_material.roughnessFactor = 0.9
-
-    if normal_texture is not None:
-        gltf.model.materials[0].normalTexture = NormalTextureInfo(
-            index=add_texture(gltf, normal_texture), scale=normal_strength
-        )
-
-    gltf.model.nodes[0].name = f"mvadapter_node_{task_id}"
-    gltf.model.meshes[0].name = f"mvadapter_mesh_{task_id}"
-    gltf.model.materials[0].name = f"mvadapter_material_{task_id}"
-    gltf.model.asset.generator = "https://github.com/huanngzh/MV-Adapter"
-    gltf.export(output_path)
+    embed_textures_in_glb(
+        input_path,
+        output_path,
+        texture,
+        metallic_roughness_texture=metallic_roughness_texture,
+        normal_texture=normal_texture,
+        texture_format=texture_format,
+        normal_strength=normal_strength,
+        task_id=task_id,
+    )
 
 
 def replace_mesh_texture_and_save(

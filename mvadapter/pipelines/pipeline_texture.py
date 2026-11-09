@@ -57,20 +57,58 @@ class TexturePipelineOutput:
 
 
 class TexturePipeline:
-    def __init__(self, upscaler_ckpt_path: str, inpaint_ckpt_path: str, device: str):
+    def __init__(
+        self,
+        upscaler_ckpt_path: str,
+        inpaint_ckpt_path: str,
+        device: str,
+        context_type: str = "gl",
+        staged_checkpoints: bool = False,
+        pb_backend: str = "torch-cuda",
+    ):
         self.device = device
-        self.ctx = NVDiffRastContextWrapper(device=self.device)
-        self.cam_proj = CameraProjection(
-            pb_backend="torch-cuda", bg_remover=None, device=self.device
+        self.context_type = context_type
+        self.staged_checkpoints = staged_checkpoints
+        self.upscaler_ckpt_path = upscaler_ckpt_path
+        self.inpaint_ckpt_path = inpaint_ckpt_path
+        self.ctx = NVDiffRastContextWrapper(
+            device=self.device, context_type=context_type
         )
-        if upscaler_ckpt_path is not None:
-            self.upscaler = ModelLoader().load_from_file(upscaler_ckpt_path)
-            self.upscaler.to(self.device).eval().half()
-        if inpaint_ckpt_path is not None:
-            self.inpainter = ModelLoader().load_from_file(inpaint_ckpt_path)
-            self.inpainter.to(self.device).eval()
+        self.cam_proj = CameraProjection(
+            pb_backend=pb_backend,
+            bg_remover=None,
+            device=self.device,
+            context_type=context_type,
+        )
+        self.upscaler = None
+        self.inpainter = None
+        if not staged_checkpoints:
+            self._load_upscaler()
+            self._load_inpainter()
 
         self.smart_painter = SmartPainter(self.device)
+
+    def _load_upscaler(self):
+        if self.upscaler is not None or not self.upscaler_ckpt_path:
+            return
+        self.upscaler = ModelLoader().load_from_file(self.upscaler_ckpt_path)
+        self.upscaler.to(self.device).eval().half()
+
+    def _load_inpainter(self):
+        if self.inpainter is not None or not self.inpaint_ckpt_path:
+            return
+        self.inpainter = ModelLoader().load_from_file(self.inpaint_ckpt_path)
+        self.inpainter.to(self.device).eval()
+
+    def _free_module(self, attr: str):
+        import gc
+
+        if getattr(self, attr) is None:
+            return
+        setattr(self, attr, None)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def load_packed_images(self, packed_image_path: Optional[str]) -> List[Image.Image]:
         if packed_image_path is None:
@@ -88,6 +126,7 @@ class TexturePipeline:
         batched: bool = False,
     ) -> Optional[torch.FloatTensor]:
         if upscale:
+            self._load_upscaler()
             with torch.no_grad():
                 tensor = tensor.permute(0, 3, 1, 2)
                 if batched:
@@ -101,6 +140,8 @@ class TexturePipeline:
                         dim=0,
                     )
                 tensor = tensor.clamp(0, 1).permute(0, 2, 3, 1)
+            if self.staged_checkpoints:
+                self._free_module("upscaler")
             clear()
         return tensor
 
@@ -116,6 +157,7 @@ class TexturePipeline:
         def inpaint_func(
             image: torch.FloatTensor, mask: torch.FloatTensor
         ) -> torch.FloatTensor:
+            self._load_inpainter()
             with torch.no_grad():
                 return self.inpainter(image.to(torch.float32), mask.to(torch.float32))
 
@@ -323,6 +365,7 @@ class TexturePipeline:
                     cam_proj_out.uv_depth_grad,
                 )
                 if uv_inpaint_use_network:
+                    self._load_inpainter()
                     uv_inpaint_mask_input = 1 - uv_valid_mask[None, None].float()
                     uv_inpaint_image_input = uv_proj[None].permute(0, 3, 1, 2)
                     with torch.no_grad():

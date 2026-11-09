@@ -1,0 +1,35 @@
+# Isolated MV-Adapter low-memory experiment for Windows CPython 3.10.
+# Install torch and torchvision FIRST from the CUDA index in
+# scripts/install_lowmem_windows.ps1. This file intentionally does not
+# depend on torch, so pip does not replace a CUDA wheel with a CPU build.
+#
+# Do not pip install -e . from setup.py. That list includes cvcuda_cu12,
+# which has no official native Windows wheel.
+#
+# Pins below were chosen because the SD2.1 pipeline module imports against
+# diffusers 0.32 APIs, and each package had a Windows artifact (or a pure
+# Python wheel) on PyPI when this file was written. They were not installed
+# on a Windows machine in the authoring run.
+
+numpy==1.26.4
+pillow==11.1.0
+opencv-python==4.10.0.84
+diffusers==0.32.2
+transformers==4.46.3
+tokenizers==0.20.3
+huggingface_hub==0.27.1
+accelerate==1.2.1
+safetensors==0.4.5
+peft==0.14.0
+einops==0.8.0
+omegaconf==2.3.0
+packaging==24.2
+jaxtyping==0.2.36
+typeguard==4.4.1
+imageio==2.36.1
+matplotlib==3.9.2
+trimesh==4.5.3
+gltflib==1.0.13
+open3d==0.18.0
+pymeshlab==2023.12.post3
+spandrel==0.4.1

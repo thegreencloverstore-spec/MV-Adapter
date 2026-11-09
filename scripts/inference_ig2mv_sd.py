@@ -30,6 +30,8 @@ def prepare_pipeline(
     num_views,
     device,
     dtype,
+    offload="none",
+    vae_tiling=False,
 ):
     # Load vae and unet if provided
     pipe_kwargs = {}
@@ -62,16 +64,20 @@ def prepare_pipeline(
         adapter_path, weight_name="mvadapter_ig2mv_sd21.safetensors"
     )
 
-    pipe.to(device=device, dtype=dtype)
-    pipe.cond_encoder.to(device=device, dtype=dtype)
-
     # load lora if provided
     if lora_model is not None:
         model_, name_ = lora_model.rsplit("/", 1)
         pipe.load_lora_weights(model_, weight_name=name_)
 
-    # vae slicing for lower memory usage
-    pipe.enable_vae_slicing()
+    from mvadapter.utils.lowmem import place_pipeline
+
+    place_pipeline(
+        pipe,
+        device=device,
+        dtype=dtype,
+        offload=offload,
+        vae_tiling=vae_tiling,
+    )
 
     return pipe
 
@@ -135,6 +141,9 @@ def run_pipeline(
     negative_prompt="watermark, ugly, deformed, noisy, blurry, low contrast",
     lora_scale=1.0,
     device="cuda",
+    context_type="gl",
+    split_cfg=False,
+    generator_device=None,
 ):
     # Prepare cameras
     cameras = get_orthogonal_camera(
@@ -147,7 +156,7 @@ def run_pipeline(
         azimuth_deg=[x - 90 for x in [0, 90, 180, 270, 180, 180]],
         device=device,
     )
-    ctx = NVDiffRastContextWrapper(device=device)
+    ctx = NVDiffRastContextWrapper(device=device, context_type=context_type)
 
     mesh = load_mesh(mesh_path, rescale=True, device=device)
     render_out = render(
@@ -185,7 +194,8 @@ def run_pipeline(
 
     pipe_kwargs = {}
     if seed != -1 and isinstance(seed, int):
-        pipe_kwargs["generator"] = torch.Generator(device=device).manual_seed(seed)
+        gen_device = device if generator_device is None else generator_device
+        pipe_kwargs["generator"] = torch.Generator(device=gen_device).manual_seed(seed)
 
     images = pipe(
         text,
@@ -200,6 +210,7 @@ def run_pipeline(
         reference_conditioning_scale=reference_conditioning_scale,
         negative_prompt=negative_prompt,
         cross_attention_kwargs={"scale": lora_scale},
+        split_cfg=split_cfg,
         **pipe_kwargs,
     ).images
 

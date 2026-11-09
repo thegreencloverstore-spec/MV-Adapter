@@ -28,13 +28,23 @@ class RenderOutput:
 
 
 class NVDiffRastContextWrapper:
-    def __init__(self, device: str, context_type: str = "gl"):
+    def __init__(self, device: str, context_type: Optional[str] = None):
+        # "gl" is the historical default. Windows and WSL often fail in
+        # cudaGraphicsGLRegisterBuffer. Set MVADAPTER_RASTER_BACKEND=cuda to
+        # use RasterizeCudaContext without editing call sites. The low-memory
+        # script passes context_type="cuda" explicitly.
+        if context_type is None:
+            import os
+
+            context_type = os.environ.get("MVADAPTER_RASTER_BACKEND", "gl")
         if context_type == "gl":
             self.ctx = dr.RasterizeGLContext(device=device)
         elif context_type == "cuda":
             self.ctx = dr.RasterizeCudaContext(device=device)
         else:
-            raise NotImplementedError
+            raise NotImplementedError(
+                f"Unknown nvdiffrast context {context_type!r}. Use 'gl' or 'cuda'."
+            )
 
     def rasterize(self, pos, tri, resolution, ranges=None, grad_db=True):
         """
